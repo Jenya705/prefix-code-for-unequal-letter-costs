@@ -1,27 +1,29 @@
 use good_lp::{default_solver, variable, variables, Expression, Solution, SolverModel};
 
-pub trait LengthSolver<'a> {
+pub trait LengthSolver {
     const BEST_SOLVER: bool;
 
-    fn new(occurences: &'a [f64], letters: &'a [f64], m: usize) -> Self;
+    fn new(occurences: &[u32], letters: &[u32], m: usize) -> Self;
+
+    fn theoretical_max(&self) -> f64;
 
     fn solve(&mut self, max_cost: f64, lengths: &mut [u32]) -> Option<f64>;
 }
 
-pub struct ILPSolver<'a> {
-    occurences: &'a [f64],
-    letters: &'a [f64],
+pub struct ILPSolver {
+    occurences: Vec<f64>,
+    letters: Vec<f64>,
     m: usize,
     v_cacher: VCacher,
     previous_attempts: Vec<Vec<u32>>,
 }
 
 struct VCacher {
-    cache: Vec<u32>,
+    cache: Vec<u64>,
 }
 
 impl VCacher {
-    pub fn get(&mut self, h: i32, letters: &[f64]) -> u32 {
+    pub fn get(&mut self, h: i32, letters: &[f64]) -> u64 {
         if h < 0 {
             0
         } else if self.cache.len() as i32 > h {
@@ -38,15 +40,21 @@ impl VCacher {
             v
         }
     }
+
+    pub fn get_f64(&mut self, h: i32, letters: &[f64]) -> f64 {
+        let res = self.get(h, letters);
+        debug_assert!(res < f64::MAX as u64);
+        res as f64
+    }
 }
 
-impl<'a> LengthSolver<'a> for ILPSolver<'a> {
+impl LengthSolver for ILPSolver {
     const BEST_SOLVER: bool = true;
 
-    fn new(occurences: &'a [f64], letters: &'a [f64], m: usize) -> Self {
+    fn new(occurences: &[u32], letters: &[u32], m: usize) -> Self {
         Self {
-            occurences,
-            letters,
+            occurences: occurences.iter().map(|v| *v as f64).collect(),
+            letters: letters.iter().map(|v| *v as f64).collect(),
             m,
             v_cacher: VCacher { cache: vec![1] },
             previous_attempts: vec![],
@@ -58,7 +66,7 @@ impl<'a> LengthSolver<'a> for ILPSolver<'a> {
 
         let mut vars_mat = vec![];
 
-        for _ in 0..self.letters.len() {
+        for _ in 0..self.occurences.len() {
             let mut v = vec![];
             for _ in 0..self.m {
                 v.push(variables.add(variable().binary()));
@@ -68,7 +76,7 @@ impl<'a> LengthSolver<'a> for ILPSolver<'a> {
 
         let mut minimise = Expression::default();
 
-        for i in 0..self.letters.len() {
+        for i in 0..self.occurences.len() {
             for j in 0..self.m {
                 minimise = minimise + vars_mat[i][j] * (self.occurences[i] * (j + 1) as f64);
             }
@@ -79,15 +87,16 @@ impl<'a> LengthSolver<'a> for ILPSolver<'a> {
         for j in 0..self.m {
             let mut expr = Expression::default();
             for p in 0..j {
-                for i in 0..self.letters.len() {
+                for i in 0..self.occurences.len() {
                     expr = expr
-                        + vars_mat[i][p] * self.v_cacher.get(j as i32 - p as i32, self.letters);
+                        + vars_mat[i][p]
+                            * self.v_cacher.get_f64(j as i32 - p as i32, &self.letters);
                 }
             }
-            problem = problem.with(expr.leq(self.v_cacher.get(j as i32, self.letters)));
+            problem = problem.with(expr.leq(self.v_cacher.get_f64(j as i32, &self.letters)));
         }
 
-        for i in 0..self.letters.len() {
+        for i in 0..self.occurences.len() {
             let mut expr = Expression::default();
             for j in 0..self.m {
                 expr = expr + vars_mat[i][j];
@@ -97,34 +106,58 @@ impl<'a> LengthSolver<'a> for ILPSolver<'a> {
 
         for prev in self.previous_attempts.iter() {
             let mut expr = Expression::default();
-            for i in 0..self.letters.len() {
+            for i in 0..self.occurences.len() {
                 expr = expr + vars_mat[i][prev[i] as usize];
             }
-            problem = problem.with(expr.leq(self.letters.len() as u32 - 1));
+            problem = problem.with(expr.leq(self.occurences.len() as u32 - 1));
         }
-        
+
+        // making the lenghts sorted
+        let gen_expr = |i: usize| -> Expression {
+            let mut expr = Expression::default();
+            for j in 0..self.m {
+                expr = expr + j as f64 * vars_mat[i][j];
+            }
+            expr
+        };
+
+        for i in 1..self.occurences.len() {
+            problem = problem.with(gen_expr(i - 1).leq(gen_expr(i)));
+        }
+
         let solution = problem.solve().unwrap();
 
-        for i in 0..self.letters.len() {
+        for i in 0..self.occurences.len() {
             for j in 0..self.m {
                 if solution.value(vars_mat[i][j]) > 0.5 {
                     lengths[i] = j as u32;
+                    break;
                 }
             }
         }
 
         self.previous_attempts.push(lengths.to_vec());
 
-        let cost = solution.eval(minimise);
+        let cost = lengths
+            .iter()
+            .zip(self.occurences.iter())
+            .map(|(&l, &o)| o * l as f64)
+            .sum();
 
         Some(cost)
     }
+
+    fn theoretical_max(&self) -> f64 {
+        // we do not need it here, because it always returns the BEST result possible and doesn't use
+        // the max cost anyway
+        f64::MAX
+    }
 }
 
-pub struct ESolver<'a> {
-    occurences: &'a [f64],
+pub struct ESolver {
+    occurences: Vec<f64>,
     occurences_prefix_sums: Vec<f64>,
-    letters: &'a [f64],
+    letters: Vec<f64>,
     t_powers: Vec<f64>,
     t_powers_prefix_sums: Vec<f64>,
     i0: usize,
@@ -155,7 +188,7 @@ fn find_t(letters: &[f64]) -> f64 {
     t0
 }
 
-impl<'a> ESolver<'a> {
+impl ESolver {
     fn progress(&mut self) -> bool {
         self.i0 += 1;
         if self.i0 == self.occurences.len() {
@@ -169,11 +202,13 @@ impl<'a> ESolver<'a> {
     }
 }
 
-impl<'a> LengthSolver<'a> for ESolver<'a> {
+impl LengthSolver for ESolver {
     const BEST_SOLVER: bool = false;
 
-    fn new(occurences: &'a [f64], letters: &'a [f64], m: usize) -> Self {
-        let t = find_t(letters);
+    fn new(occurences: &[u32], letters: &[u32], m: usize) -> Self {
+        let occurences = occurences.iter().map(|v| *v as f64).collect::<Vec<_>>();
+        let letters = letters.iter().map(|v| *v as f64).collect::<Vec<_>>();
+        let t = find_t(&letters);
         let mut t_powers = vec![1.0; m];
         let mut t_powers_prefix_sums = vec![1.0; m];
         for i in 1..m {
@@ -181,13 +216,15 @@ impl<'a> LengthSolver<'a> for ESolver<'a> {
             t_powers_prefix_sums[i] = t_powers_prefix_sums[i - 1] + t_powers[i];
         }
 
-        let mut occurences_prefix_sums = vec![occurences[0]; letters.len()];
-        for i in 1..letters.len() {
+        let mut occurences_prefix_sums = vec![occurences[0]; occurences.len()];
+        for i in 1..occurences.len() {
             occurences_prefix_sums[i] = occurences_prefix_sums[i - 1] + occurences[i];
         }
 
-        let mut sorted = Vec::with_capacity(m * letters.len());
-        for i in 0..letters.len() {
+        let goal = (occurences.len() as f64 - 1.0) / (1.0 - t);
+
+        let mut sorted = Vec::with_capacity(m * occurences.len());
+        for i in 0..occurences.len() {
             for j in 0..m {
                 sorted.push((i, j, occurences[i] * t.powi(-(j as i32 + 1))));
             }
@@ -209,9 +246,25 @@ impl<'a> LengthSolver<'a> for ESolver<'a> {
             i0: 0,
             j0: 0,
             m,
-            goal: (letters.len() as f64 - 1.0) / (1.0 - t),
+            goal,
             order: sorted,
         }
+    }
+
+    fn theoretical_max(&self) -> f64 {
+        const DIV: f64 = 0.90;
+
+        let sub = self
+            .occurences_prefix_sums
+            .last()
+            .unwrap()
+            .log(self.t_powers[1]);
+
+        self.occurences
+            .iter()
+            .map(|&v| v * (v.log(self.t_powers[1]) - sub))
+            .sum::<f64>()
+            / DIV
     }
 
     fn solve(&mut self, max_cost: f64, lengths: &mut [u32]) -> Option<f64> {
@@ -226,12 +279,12 @@ impl<'a> LengthSolver<'a> for ESolver<'a> {
             let mut res = 0.0;
 
             // setting initial lengths
-            for i in self.i0..self.letters.len() {
+            for i in self.i0..self.occurences.len() {
                 lengths[i] = self.j0 as u32 + 1;
                 // TODO: occurences sums
                 // res += self.occurences[i];
             }
-            res += self.occurences_prefix_sums[self.letters.len() - 1];
+            res += self.occurences_prefix_sums[self.occurences.len() - 1];
             res *= (self.j0 + 1) as f64;
 
             // calculating initial subject
@@ -243,14 +296,14 @@ impl<'a> LengthSolver<'a> for ESolver<'a> {
             }
             */
             subject += self.t_powers_prefix_sums[self.j0];
-            subject *= (self.letters.len() - self.i0) as f64;
+            subject *= (self.occurences.len() - self.i0) as f64;
 
             for &(i, j) in self.order.iter().filter(|&&(i, j)| {
                 !(i <= self.i0 && j > self.j0) && !(i >= self.i0 && j <= self.j0)
             }) {
                 subject += self.t_powers[j];
                 lengths[i] += 1;
-                res += self.letters[i];
+                res += self.occurences[i];
 
                 if res > max_cost {
                     break;
