@@ -1,4 +1,7 @@
-use std::{cmp::Reverse, collections::BinaryHeap};
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap},
+};
 
 pub type TreeIndex = u128;
 
@@ -25,14 +28,14 @@ impl TreeSolver for FirstToFindTreeSolver {
         let mut length_changed = false;
 
         self.heap.clear();
-        self.heap.push((Reverse(0), 1));
+        self.heap.push((Reverse(0), 0));
 
         while let Some((Reverse(cost), mut i)) = self.heap.pop() {
             if cost < lengths[0] {
                 i *= self.letters.len() as TreeIndex;
                 for &letter in self.letters.iter() {
-                    self.heap.push((Reverse(cost + letter), i));
                     i += 1;
+                    self.heap.push((Reverse(cost + letter), i));
                 }
             } else {
                 length_changed = length_changed || lengths[0] != cost;
@@ -46,6 +49,28 @@ impl TreeSolver for FirstToFindTreeSolver {
             }
         }
 
-        Some(length_changed)
+        (lengths.len() == 0).then_some(length_changed)
     }
+}
+
+pub fn optimize_tree(
+    map: &mut HashMap<TreeIndex, u32>,
+    letters: TreeIndex,
+    indices: &mut [TreeIndex],
+) {
+    map.clear();
+
+    for i in indices.iter() {
+        let mut i = *i;
+        loop {
+            i -= 1;
+            i /= letters;
+            if i == 0 {
+                break;
+            }
+            *map.entry(i).or_insert(0) += 1;
+        }
+    }
+
+    println!("{map:?}");
 }

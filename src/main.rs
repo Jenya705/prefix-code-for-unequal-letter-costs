@@ -3,9 +3,10 @@ use std::{
     collections::{BinaryHeap, HashMap, HashSet},
 };
 
-use length::{ESolver, ILPSolver, LengthSolver};
+use clap::{Parser, ValueEnum};
+use length::{ESolver, GivenSolver, ILPSolver, LengthSolver, RelaxedLPSolver};
 use scanner::Scanner;
-use tree::{FirstToFindTreeSolver, TreeIndex, TreeSolver};
+use tree::{optimize_tree, FirstToFindTreeSolver, TreeIndex, TreeSolver};
 
 pub mod length;
 pub mod scanner;
@@ -21,7 +22,7 @@ fn gen_tree(
 
     write.write(b"DiGraph {").unwrap();
 
-    heap.push((Reverse(0u32), 1));
+    heap.push((Reverse(0u32), 0));
 
     while let Some((Reverse(cost), mut i)) = heap.pop() {
         if exclude.contains(&i) {
@@ -34,13 +35,13 @@ fn gen_tree(
             let i_c = i;
             i *= letters.len() as TreeIndex;
             for &letter in letters {
+                i += 1;
                 heap.push((Reverse(cost + letter), i));
                 write
                     .write(
                         format!(r#""{:?}" -> "{:?}";"#, (i_c, cost), (i, cost + letter)).as_bytes(),
                     )
                     .unwrap();
-                i += 1;
             }
         }
     }
@@ -48,25 +49,8 @@ fn gen_tree(
     write.write(b"}").unwrap();
 }
 
-#[derive(Clone, Copy)]
-enum ChosenInputFormat {
-    Message,
-    Occurences,
-}
-
-#[derive(Clone, Copy)]
-enum ChosenLengthSolver {
-    ILP,
-    E,
-}
-
-#[derive(Clone, Copy)]
-enum ChosenTreeSolver {
-    FirstToFind,
-}
-
 fn read_input(
-    format: ChosenInputFormat,
+    format: AppInputFormat,
     scanner: &mut Scanner<impl std::io::BufRead>,
 ) -> (Vec<u32>, Vec<(char, u32)>) {
     let n = scanner.read::<usize>();
@@ -75,7 +59,7 @@ fn read_input(
         letters.push(scanner.read());
     }
     let occurences = match format {
-        ChosenInputFormat::Message => {
+        AppInputFormat::Message => {
             let message = scanner.read_line().to_string();
             let mut occurences = HashMap::new();
             for c in message.chars() {
@@ -84,7 +68,7 @@ fn read_input(
             let occurences = occurences.into_iter().collect::<Vec<_>>();
             occurences
         }
-        ChosenInputFormat::Occurences => {
+        AppInputFormat::Occurences => {
             let n = scanner.read::<usize>();
             let mut occurences = Vec::with_capacity(n);
             for _ in 0..n {
@@ -96,13 +80,15 @@ fn read_input(
     (letters, occurences)
 }
 
+type Attempt = (f64, Vec<u32>, Vec<u128>);
+
 fn solve<L: LengthSolver, T: TreeSolver>(
     letters: &[u32],
     occurences: &[u32],
-) -> Option<(f64, Vec<u32>, Vec<u128>)> {
-    let m = 30; // max possible letter cost
-
-    let mut length_solver = L::new(&occurences, &letters, m);
+    time_limit: Option<u32>,
+    mut attempts_history: Option<&mut Vec<Attempt>>,
+) -> Option<Attempt> {
+    let mut length_solver = L::new(&occurences, &letters);
     let mut tree_solver = T::new(letters);
 
     let mut max_cost = length_solver.theoretical_max();
@@ -112,14 +98,31 @@ fn solve<L: LengthSolver, T: TreeSolver>(
     let mut best_lengths = vec![0; occurences.len()];
     let mut best_indices = vec![0; occurences.len()];
 
+    let mut optimize_tree_map = HashMap::new();
+
+    let start = std::time::Instant::now();
+
     loop {
+        if matches!(time_limit, Some(limit) if start.elapsed().as_secs() > limit as _) {
+            break;
+        }
+
         let Some(mut cost) = length_solver.solve(max_cost, &mut lengths) else {
             break;
         };
 
         let non_adjusted_cost = cost;
 
-        println!("{cost} {lengths:?}");
+        println!("{cost}: {lengths:?}");
+
+        if non_adjusted_cost > max_cost {
+            if L::BEST_SOLVER {
+                // we will find nothing better anyway
+                break;
+            } else {
+                continue;
+            }
+        }
 
         match tree_solver.solve(&mut lengths, &mut indices) {
             Some(true) => {
@@ -136,14 +139,20 @@ fn solve<L: LengthSolver, T: TreeSolver>(
             }
         }
 
+        optimize_tree(&mut optimize_tree_map, letters.len() as u128, &mut indices);
+
         if cost < max_cost {
             best_lengths.clone_from(&lengths);
             best_indices.clone_from(&indices);
         }
 
+        if let Some(ref mut attempts_story) = attempts_history {
+            attempts_story.push((cost, lengths.clone(), indices.clone()));
+        }
+
         max_cost = cost;
 
-        if L::BEST_SOLVER && (non_adjusted_cost == cost || non_adjusted_cost >= max_cost) {
+        if L::BEST_SOLVER && non_adjusted_cost == cost {
             break;
         }
     }
@@ -151,118 +160,183 @@ fn solve<L: LengthSolver, T: TreeSolver>(
     Some((max_cost, best_lengths, best_indices))
 }
 
-fn main() {
-    let mut input_format = ChosenInputFormat::Message;
-    let mut length_solver = ChosenLengthSolver::ILP;
-    let mut tree_solver = ChosenTreeSolver::FirstToFind;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum AppInputFormat {
+    Message,
+    Occurences,
+}
 
-    let mut output_graph = false;
-    let mut output_lengths = true;
-    let mut output_indices = true;
-    let mut output_codes = true;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum AppLengthSolver {
+    ILP,
+    RLP,
+    E,
+    Given,
+}
 
-    for arg in std::env::args().skip(1) {
-        if arg == "--ilp" || arg == "--lp" {
-            length_solver = ChosenLengthSolver::ILP;
-        } else if arg == "--e" {
-            length_solver = ChosenLengthSolver::E;
-        } else if arg == "--msg" {
-            input_format = ChosenInputFormat::Message;
-        } else if arg == "--occ" {
-            input_format = ChosenInputFormat::Occurences;
-        } else if arg == "--ftf" {
-            tree_solver = ChosenTreeSolver::FirstToFind;
-        } else if arg == "--graph" {
-            output_graph = !output_graph;
-        } else if arg == "--lengths" {
-            output_lengths = !output_lengths;
-        } else if arg == "--indices" || arg == "--indexes" {
-            output_indices = !output_indices;
-        } else if arg == "--codes" {
-            output_codes = !output_codes;
-        } else {
-            let file = std::fs::File::open(&arg).unwrap();
-            let mut scanner = Scanner::new(std::io::BufReader::new(file));
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum AppTreeSolver {
+    FirstToFind,
+}
 
-            let (letters, mut occurences) = read_input(input_format, &mut scanner);
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct App {
+    #[arg(short, value_enum, default_value_t = AppLengthSolver::ILP)]
+    length_solver: AppLengthSolver,
 
-            occurences.sort_unstable_by_key(|v| Reverse(v.1));
+    #[arg(short, value_enum, default_value_t = AppInputFormat::Message)]
+    input_format: AppInputFormat,
 
-            let occurences_count = occurences.iter().map(|v| v.1).collect::<Vec<_>>();
+    #[arg(short, value_enum, default_value_t = AppTreeSolver::FirstToFind)]
+    tree_solver: AppTreeSolver,
 
-            let start = std::time::Instant::now();
+    #[arg(long = "og", default_value_t = false)]
+    output_graph: bool,
 
-            let solve_fn = match (length_solver, tree_solver) {
-                (ChosenLengthSolver::ILP, ChosenTreeSolver::FirstToFind) => {
-                    solve::<ILPSolver, FirstToFindTreeSolver>
-                }
-                (ChosenLengthSolver::E, ChosenTreeSolver::FirstToFind) => {
-                    solve::<ESolver, FirstToFindTreeSolver>
-                }
-            };
+    #[arg(long = "ol", default_value_t = true)]
+    output_lengths: bool,
 
-            match solve_fn(&letters, &occurences_count) {
-                Some((cost, lengths, indices)) => {
-                    println!("cost: {}", cost);
+    #[arg(long = "oi", default_value_t = false)]
+    output_indices: bool,
 
-                    if output_graph {
-                        let mut exclude = HashSet::new();
-                        for i in 0..indices.len() {
-                            exclude.insert(indices[i]);
-                        }
-                        gen_tree(
-                            *lengths.iter().max().unwrap(),
-                            &letters,
-                            &exclude,
-                            std::io::stdout().lock(),
-                        );
-                        println!();
-                    }
+    #[arg(long = "ot", default_value_t = false)]
+    output_table: bool,
 
-                    if output_lengths {
-                        println!(
-                            "lengths: {}",
-                            lengths
-                                .iter()
-                                .map(|v| v.to_string())
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        );
-                    }
+    #[arg(short = 's', long, default_value_t = false)]
+    history: bool,
 
-                    if output_indices {
-                        println!(
-                            "indices: {}",
-                            indices
-                                .iter()
-                                .map(|v| v.to_string())
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        );
-                    }
+    #[arg(long)]
+    time_limit: Option<u32>,
 
-                    if output_codes {
-                        for i in 0..indices.len() {
-                            print!("{}: ", occurences[i].0);
-                            let mut i = indices[i];
-                            loop {
-                                let j = i % letters.len() as u128;
-                                i /= letters.len() as u128;
-                                print!("{} ", j);
-                                if i == 1 {
-                                    break;
-                                }
-                            }
-                            println!();
-                        }
-                    }
-                }
-                None => {
-                    println!("found nothing");
+    #[arg()]
+    input_file: String,
+}
+
+fn output_attempt(attempt: &Attempt, letters: &[u32], occurences: &[(char, u32)], app: &App) {
+    let (cost, lengths, indices) = attempt;
+
+    println!("cost: {}", cost);
+
+    if app.output_graph {
+        let mut exclude = HashSet::new();
+        for i in 0..indices.len() {
+            exclude.insert(indices[i]);
+        }
+        gen_tree(
+            *lengths.iter().max().unwrap(),
+            &letters,
+            &exclude,
+            std::io::stdout().lock(),
+        );
+        println!();
+    }
+
+    if app.output_lengths {
+        println!(
+            "lengths: {}",
+            lengths
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+
+    if app.output_indices {
+        println!(
+            "indices: {}",
+            indices
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+
+    if app.output_table {
+        let mut to_output = vec![];
+        for i in 0..indices.len() {
+            print!("{}: ", occurences[i].0);
+            let mut i = indices[i];
+            loop {
+                i -= 1;
+                let j = i % letters.len() as u128;
+                i /= letters.len() as u128;
+                to_output.push(j as u32);
+                if i == 0 {
+                    break;
                 }
             }
+            for to_output in to_output.drain(..).rev() {
+                print!("{to_output} ");
+            }
+            println!();
+        }
+    }
+}
 
-            println!("time elapsed: {:?}", start.elapsed());
+fn main() {
+    let app = App::parse();
+
+    let file = std::fs::File::open(&app.input_file).unwrap();
+    let mut scanner = Scanner::new(std::io::BufReader::new(file));
+
+    let (letters, mut occurences) = read_input(app.input_format, &mut scanner);
+    occurences.sort_unstable_by_key(|v| Reverse(v.1));
+
+    let occurences_count = occurences.iter().map(|v| v.1).collect::<Vec<_>>();
+
+    let solve_fn = match (app.length_solver, app.tree_solver) {
+        (AppLengthSolver::ILP, AppTreeSolver::FirstToFind) => {
+            solve::<ILPSolver, FirstToFindTreeSolver>
+        }
+        (AppLengthSolver::E, AppTreeSolver::FirstToFind) => solve::<ESolver, FirstToFindTreeSolver>,
+        (AppLengthSolver::Given, AppTreeSolver::FirstToFind) => {
+            solve::<GivenSolver, FirstToFindTreeSolver>
+        }
+        (AppLengthSolver::RLP, AppTreeSolver::FirstToFind) => {
+            solve::<RelaxedLPSolver, FirstToFindTreeSolver>
+        }
+    };
+
+    let mut attempts_history = app.history.then(|| vec![]);
+
+    let start = std::time::Instant::now();
+
+    match solve_fn(
+        &letters,
+        &occurences_count,
+        app.time_limit,
+        attempts_history.as_mut(),
+    ) {
+        Some(attempt) => {
+            output_attempt(&attempt, &letters, &occurences, &app);
+        }
+        None => {
+            println!("found nothing");
+        }
+    }
+
+    println!("time elapsed: {:?}", start.elapsed());
+
+    if let Some(attempts_history) = attempts_history {
+        let mut scanner = Scanner::new(std::io::BufReader::new(std::io::stdin().lock()));
+
+        for i in 0..attempts_history.len() {
+            println!(
+                "{i}: {} {:?}",
+                attempts_history[i].0, &attempts_history[i].1
+            );
+        }
+
+        loop {
+            let i = scanner.read::<isize>();
+            if i == -1 {
+                break;
+            }
+            let i = i as usize;
+            output_attempt(&attempts_history[i], &letters, &occurences, &app);
         }
     }
 }

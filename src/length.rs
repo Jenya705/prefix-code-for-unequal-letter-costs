@@ -1,16 +1,20 @@
-use good_lp::{default_solver, variable, variables, Expression, Solution, SolverModel};
+use good_lp::{
+    default_solver, variable, variables, Expression, Solution, SolverModel, VariableDefinition,
+};
 
 pub trait LengthSolver {
     const BEST_SOLVER: bool;
 
-    fn new(occurences: &[u32], letters: &[u32], m: usize) -> Self;
+    fn new(occurences: &[u32], letters: &[u32]) -> Self;
+
+    fn m(&self) -> usize;
 
     fn theoretical_max(&self) -> f64;
 
     fn solve(&mut self, max_cost: f64, lengths: &mut [u32]) -> Option<f64>;
 }
 
-pub struct ILPSolver {
+pub struct LPSolver {
     occurences: Vec<f64>,
     letters: Vec<f64>,
     m: usize,
@@ -18,27 +22,198 @@ pub struct ILPSolver {
     previous_attempts: Vec<Vec<u32>>,
 }
 
-struct VCacher {
+impl LPSolver {
+    fn new(occurences: &[u32], letters: &[u32]) -> Self {
+        let mut v_cacher = VCacher::new();
+
+        let letters = letters.iter().map(|v| *v as f64).collect::<Vec<_>>();
+
+        Self {
+            m: v_cacher.determine_max_h(100, &letters) as usize,
+            occurences: occurences.iter().map(|v| *v as f64).collect(),
+            letters,
+            v_cacher,
+            previous_attempts: vec![],
+        }
+    }
+
+    fn solve<F>(&mut self, lengths: &mut [u32], mut configurate_variable: F) -> Option<f64>
+    where
+        F: FnMut(VariableDefinition) -> VariableDefinition,
+    {
+        const FORMAL_LENGTH_DEFINITION: bool = false;
+
+        loop {
+            let mut variables = variables!();
+
+            let mut vars_mat = vec![];
+
+            for _ in 0..self.occurences.len() {
+                let mut v = vec![];
+                for _ in 0..self.m {
+                    v.push(variables.add((configurate_variable)(variable())));
+                }
+                vars_mat.push(v);
+            }
+
+            let mut minimise = Expression::default();
+
+            for i in 0..self.occurences.len() {
+                for j in 0..self.m {
+                    minimise = minimise + vars_mat[i][j] * (self.occurences[i] * (j + 1) as f64);
+                }
+            }
+
+            let mut problem = variables.minimise(minimise.clone()).using(default_solver);
+
+            for j in 0..self.m {
+                let mut expr = Expression::default();
+                for p in 0..j {
+                    for i in 0..self.occurences.len() {
+                        expr = expr
+                            + vars_mat[i][p]
+                                * self.v_cacher.get_f64(j as i32 - p as i32, &self.letters);
+                    }
+                }
+                problem = problem.with(expr.leq(self.v_cacher.get_f64(j as i32, &self.letters)));
+            }
+
+            for i in 0..self.occurences.len() {
+                let mut expr = Expression::default();
+                for j in 0..self.m {
+                    expr = expr + vars_mat[i][j];
+                }
+                problem = problem.with(expr.eq(1));
+            }
+
+            for prev in self.previous_attempts.iter() {
+                if !FORMAL_LENGTH_DEFINITION {
+                    let mut expr = Expression::default();
+                    for i in 0..self.occurences.len() {
+                        expr = expr + vars_mat[i][prev[i] as usize];
+                    }
+                    problem = problem.with(expr.leq(self.occurences.len() as f64 - 1.0));
+                } else {
+                    let mut expr = Expression::default();
+                    
+                }
+            }
+
+            // making the lengths sorted
+            let gen_expr = |i: usize| -> Expression {
+                let mut expr = Expression::default();
+                for j in 0..self.m {
+                    expr = expr + j as f64 * vars_mat[i][j];
+                }
+                expr
+            };
+
+            for i in 1..self.occurences.len() {
+                problem = problem.with(gen_expr(i - 1).leq(gen_expr(i)));
+            }
+
+            // I cannot prove that generation of max m is right, thus
+            // I need to handle the case when it is not and try to adjust the value
+            // in order to be able to solve the problem in the first place
+            // but the library's author didn't make the error handling for cases, when the problem
+            // itself is defined wrongly, so I have to do it myself :P
+            let solution = match std::panic::catch_unwind(|| problem.solve()) {
+                Ok(sol) => sol.ok()?,
+                Err(_) => {
+                    self.m -= 1;
+                    continue;
+                }
+            };
+
+            let calculate_l = |i: usize| -> u32 {
+                if !FORMAL_LENGTH_DEFINITION {
+                    for j in 0..self.m {
+                        if solution.value(vars_mat[i][j]) > 0.5 {
+                            return j as u32;
+                        }
+                    }
+                } else {
+                    let mut l = 0.0;
+                    for j in 0..self.m {
+                        l += j as f64 * solution.value(vars_mat[i][j]);
+                    }
+                    return l.round() as u32;
+                }
+                unreachable!()
+            };
+
+            for i in 0..self.occurences.len() {
+                lengths[i] = calculate_l(i);
+            }
+
+            self.previous_attempts.push(lengths.to_vec());
+
+            let cost = lengths
+                .iter()
+                .zip(self.occurences.iter())
+                .map(|(&l, &o)| o * l as f64)
+                .sum();
+
+            return Some(cost);
+        }
+    }
+}
+
+pub struct ILPSolver {
+    solver: LPSolver,
+}
+
+pub struct VCacher {
     cache: Vec<u64>,
 }
 
 impl VCacher {
-    pub fn get(&mut self, h: i32, letters: &[f64]) -> u64 {
-        if h < 0 {
+    pub fn new() -> Self {
+        Self { cache: vec![1] }
+    }
+
+    // TODO: make it work for ilp
+    pub fn determine_max_h(&mut self, max: i32, letters: &[f64]) -> i32 {
+        let mut sum = 0u64;
+
+        for h in 0..max {
+            if self.try_get(h, letters).is_none() {
+                return h;
+            }
+
+            match sum
+                .checked_add(self.get(h, letters))
+                .filter(|&v| v < u32::MAX as u64)
+            {
+                Some(v) => sum = v,
+                None => return h,
+            }
+        }
+        max
+    }
+
+    pub fn try_get(&mut self, h: i32, letters: &[f64]) -> Option<u64> {
+        let res = if h < 0 {
             0
         } else if self.cache.len() as i32 > h {
             self.cache[h as usize]
         } else {
             for h in self.cache.len() as i32..h {
-                let _ = self.get(h, letters);
+                let _ = self.try_get(h, letters)?;
             }
-            let mut v = 0;
+            let mut v = 0u64;
             for i in 0..letters.len() {
-                v += self.get(h - letters[i] as i32, letters);
+                v = v.checked_add(self.try_get(h - letters[i] as i32, letters)?)?;
             }
             self.cache.push(v);
             v
-        }
+        };
+
+        Some(res)
+    }
+
+    pub fn get(&mut self, h: i32, letters: &[f64]) -> u64 {
+        self.try_get(h, letters).unwrap()
     }
 
     pub fn get_f64(&mut self, h: i32, letters: &[f64]) -> f64 {
@@ -51,106 +226,51 @@ impl VCacher {
 impl LengthSolver for ILPSolver {
     const BEST_SOLVER: bool = true;
 
-    fn new(occurences: &[u32], letters: &[u32], m: usize) -> Self {
+    fn new(occurences: &[u32], letters: &[u32]) -> Self {
         Self {
-            occurences: occurences.iter().map(|v| *v as f64).collect(),
-            letters: letters.iter().map(|v| *v as f64).collect(),
-            m,
-            v_cacher: VCacher { cache: vec![1] },
-            previous_attempts: vec![],
+            solver: LPSolver::new(occurences, letters),
         }
     }
 
+    fn m(&self) -> usize {
+        self.solver.m
+    }
+
     fn solve(&mut self, _max_cost: f64, lengths: &mut [u32]) -> Option<f64> {
-        let mut variables = variables!();
-
-        let mut vars_mat = vec![];
-
-        for _ in 0..self.occurences.len() {
-            let mut v = vec![];
-            for _ in 0..self.m {
-                v.push(variables.add(variable().binary()));
-            }
-            vars_mat.push(v);
-        }
-
-        let mut minimise = Expression::default();
-
-        for i in 0..self.occurences.len() {
-            for j in 0..self.m {
-                minimise = minimise + vars_mat[i][j] * (self.occurences[i] * (j + 1) as f64);
-            }
-        }
-
-        let mut problem = variables.minimise(minimise.clone()).using(default_solver);
-
-        for j in 0..self.m {
-            let mut expr = Expression::default();
-            for p in 0..j {
-                for i in 0..self.occurences.len() {
-                    expr = expr
-                        + vars_mat[i][p]
-                            * self.v_cacher.get_f64(j as i32 - p as i32, &self.letters);
-                }
-            }
-            problem = problem.with(expr.leq(self.v_cacher.get_f64(j as i32, &self.letters)));
-        }
-
-        for i in 0..self.occurences.len() {
-            let mut expr = Expression::default();
-            for j in 0..self.m {
-                expr = expr + vars_mat[i][j];
-            }
-            problem = problem.with(expr.eq(1));
-        }
-
-        for prev in self.previous_attempts.iter() {
-            let mut expr = Expression::default();
-            for i in 0..self.occurences.len() {
-                expr = expr + vars_mat[i][prev[i] as usize];
-            }
-            problem = problem.with(expr.leq(self.occurences.len() as u32 - 1));
-        }
-
-        // making the lenghts sorted
-        let gen_expr = |i: usize| -> Expression {
-            let mut expr = Expression::default();
-            for j in 0..self.m {
-                expr = expr + j as f64 * vars_mat[i][j];
-            }
-            expr
-        };
-
-        for i in 1..self.occurences.len() {
-            problem = problem.with(gen_expr(i - 1).leq(gen_expr(i)));
-        }
-
-        let solution = problem.solve().unwrap();
-
-        for i in 0..self.occurences.len() {
-            for j in 0..self.m {
-                if solution.value(vars_mat[i][j]) > 0.5 {
-                    lengths[i] = j as u32;
-                    break;
-                }
-            }
-        }
-
-        self.previous_attempts.push(lengths.to_vec());
-
-        let cost = lengths
-            .iter()
-            .zip(self.occurences.iter())
-            .map(|(&l, &o)| o * l as f64)
-            .sum();
-
-        Some(cost)
+        self.solver.solve(lengths, |variable| variable.binary())
     }
 
     fn theoretical_max(&self) -> f64 {
         // we do not need it here, because it always returns the BEST result possible and doesn't use
         // the max cost anyway
         f64::MAX
+    }
+}
+
+pub struct RelaxedLPSolver {
+    solver: LPSolver,
+}
+
+impl LengthSolver for RelaxedLPSolver {
+    const BEST_SOLVER: bool = false;
+
+    fn new(occurences: &[u32], letters: &[u32]) -> Self {
+        Self {
+            solver: LPSolver::new(occurences, letters),
+        }
+    }
+
+    fn m(&self) -> usize {
+        self.solver.m
+    }
+
+    fn theoretical_max(&self) -> f64 {
+        f64::MAX
+    }
+
+    fn solve(&mut self, _max_cost: f64, lengths: &mut [u32]) -> Option<f64> {
+        self.solver
+            .solve(lengths, |variable| variable.bounds(0..=1))
     }
 }
 
@@ -205,9 +325,12 @@ impl ESolver {
 impl LengthSolver for ESolver {
     const BEST_SOLVER: bool = false;
 
-    fn new(occurences: &[u32], letters: &[u32], m: usize) -> Self {
+    fn new(occurences: &[u32], letters: &[u32]) -> Self {
         let occurences = occurences.iter().map(|v| *v as f64).collect::<Vec<_>>();
         let letters = letters.iter().map(|v| *v as f64).collect::<Vec<_>>();
+
+        let m = VCacher::new().determine_max_h(100, &letters) as usize;
+
         let t = find_t(&letters);
         let mut t_powers = vec![1.0; m];
         let mut t_powers_prefix_sums = vec![1.0; m];
@@ -249,6 +372,10 @@ impl LengthSolver for ESolver {
             goal,
             order: sorted,
         }
+    }
+
+    fn m(&self) -> usize {
+        self.m
     }
 
     fn theoretical_max(&self) -> f64 {
@@ -319,5 +446,40 @@ impl LengthSolver for ESolver {
                 return None;
             }
         }
+    }
+}
+
+// A hacky way to generate trees for a given input
+pub struct GivenSolver {
+    result: Option<Vec<u32>>,
+}
+
+impl LengthSolver for GivenSolver {
+    const BEST_SOLVER: bool = true;
+
+    fn new(occurences: &[u32], _letters: &[u32]) -> Self {
+        Self {
+            result: Some(occurences.to_vec()),
+        }
+    }
+
+    fn m(&self) -> usize {
+        self.result
+            .as_ref()
+            .and_then(|v| v.last().cloned())
+            .unwrap_or(0) as usize
+    }
+
+    fn theoretical_max(&self) -> f64 {
+        f64::MAX
+    }
+
+    fn solve(&mut self, _max_cost: f64, lengths: &mut [u32]) -> Option<f64> {
+        let result = self.result.take()?;
+
+        lengths.clone_from_slice(&result);
+
+        // cost doesn't matter at this point
+        Some(1.0)
     }
 }

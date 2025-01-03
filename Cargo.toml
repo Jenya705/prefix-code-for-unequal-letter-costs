@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-clap = "4.5.23"
+clap = { version = "4.5.23", features = ["derive"] }
 fixedbitset = "0.5.7"
 good_lp = { version = "1.10.0", features = ["highs"], default-features = false }
