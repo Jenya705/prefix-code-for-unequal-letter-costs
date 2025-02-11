@@ -1,12 +1,17 @@
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet},
+    io::Read,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
 };
 
 use clap::{Parser, ValueEnum};
 use length::{ESolver, GivenSolver, ILPSolver, LengthSolver, RelaxedLPSolver};
 use scanner::Scanner;
-use tree::{optimize_tree, FirstToFindTreeSolver, TreeIndex, TreeSolver};
+use tree::{FirstToFindTreeSolver, TreeIndex, TreeOptimizer, TreeSolver};
 
 pub mod length;
 pub mod scanner;
@@ -62,7 +67,10 @@ fn read_input(
         AppInputFormat::Message => {
             let message = scanner.read_line().to_string();
             let mut occurences = HashMap::new();
-            for c in message.chars() {
+            for mut c in message.chars() {
+                if c == '\n' {
+                    c = ' ';
+                }
                 *occurences.entry(c).or_insert(0) += 1;
             }
             let occurences = occurences.into_iter().collect::<Vec<_>>();
@@ -98,12 +106,35 @@ fn solve<L: LengthSolver, T: TreeSolver>(
     let mut best_lengths = vec![0; occurences.len()];
     let mut best_indices = vec![0; occurences.len()];
 
-    let mut optimize_tree_map = HashMap::new();
+    let mut tree_optimizer = TreeOptimizer::new(occurences.len());
 
     let start = std::time::Instant::now();
 
+    let counter = Arc::new(AtomicU8::new(0));
+
+    {
+        let counter = Arc::clone(&counter);
+        std::thread::spawn(move || loop {
+            let mut buf = [0; 10];
+            if let Ok(l) = std::io::stdin().lock().read(&mut buf) {
+                const WORD: &[u8] = b"break";
+                if l > WORD.len() && &buf[..WORD.len()] == WORD {
+                    counter.store(1, Ordering::Relaxed);
+                    return;
+                }
+                if counter.load(Ordering::Relaxed) == 2 {
+                    return;
+                }
+            }
+        });
+    }
+
     loop {
         if matches!(time_limit, Some(limit) if start.elapsed().as_secs() > limit as _) {
+            break;
+        }
+
+        if counter.load(Ordering::Relaxed) == 1 {
             break;
         }
 
@@ -112,8 +143,6 @@ fn solve<L: LengthSolver, T: TreeSolver>(
         };
 
         let non_adjusted_cost = cost;
-
-        println!("{cost}: {lengths:?}");
 
         if non_adjusted_cost > max_cost {
             if L::BEST_SOLVER {
@@ -124,22 +153,21 @@ fn solve<L: LengthSolver, T: TreeSolver>(
             }
         }
 
-        match tree_solver.solve(&mut lengths, &mut indices) {
-            Some(true) => {
-                cost = 0.0;
-                for i in 0..occurences.len() {
-                    cost += occurences[i] as f64 * lengths[i] as f64;
-                }
-            }
-            Some(false) => {
-                // Nothing
-            }
+        let changed = match tree_solver.solve(&mut lengths, &mut indices) {
+            Some(changed) => changed,
             None => {
                 continue;
             }
-        }
+        };
 
-        optimize_tree(&mut optimize_tree_map, letters.len() as u128, &mut indices);
+        let changed = tree_optimizer.optimize(&letters, &mut lengths, &mut indices) || changed;
+
+        if changed {
+            cost = 0.0;
+            for i in 0..occurences.len() {
+                cost += occurences[i] as f64 * lengths[i] as f64;
+            }
+        }
 
         if cost < max_cost {
             best_lengths.clone_from(&lengths);
@@ -150,14 +178,20 @@ fn solve<L: LengthSolver, T: TreeSolver>(
             attempts_story.push((cost, lengths.clone(), indices.clone()));
         }
 
-        max_cost = cost;
+        max_cost = cost.min(max_cost);
 
         if L::BEST_SOLVER && non_adjusted_cost == cost {
             break;
         }
     }
 
-    Some((max_cost, best_lengths, best_indices))
+    counter.store(2, Ordering::Relaxed);
+
+    if best_lengths[0] == 0 {
+        None
+    } else {
+        Some((max_cost, best_lengths, best_indices))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -216,11 +250,18 @@ struct App {
 fn output_attempt(attempt: &Attempt, letters: &[u32], occurences: &[(char, u32)], app: &App) {
     let (cost, lengths, indices) = attempt;
 
-    println!("cost: {}", cost);
+    println!(
+        "cost: {}, avg. cost pro symbol: {:.3}",
+        cost,
+        cost / occurences.iter().map(|v| v.1).sum::<u32>() as f64
+    );
 
     if app.output_graph {
         let mut exclude = HashSet::new();
         for i in 0..indices.len() {
+            if indices[i] == 0 {
+                break;
+            }
             exclude.insert(indices[i]);
         }
         gen_tree(

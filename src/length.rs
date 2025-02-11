@@ -1,5 +1,6 @@
 use good_lp::{
-    default_solver, variable, variables, Expression, Solution, SolverModel, VariableDefinition,
+    default_solver, solvers::highs::HighsParallelType, variable, variables, Expression, Solution,
+    SolverModel, VariableDefinition,
 };
 
 pub trait LengthSolver {
@@ -29,7 +30,7 @@ impl LPSolver {
         let letters = letters.iter().map(|v| *v as f64).collect::<Vec<_>>();
 
         Self {
-            m: v_cacher.determine_max_h(100, &letters) as usize,
+            m: (v_cacher.determine_max_h(100, &letters) as usize).min(100),
             occurences: occurences.iter().map(|v| *v as f64).collect(),
             letters,
             v_cacher,
@@ -41,8 +42,6 @@ impl LPSolver {
     where
         F: FnMut(VariableDefinition) -> VariableDefinition,
     {
-        const FORMAL_LENGTH_DEFINITION: bool = false;
-
         loop {
             let mut variables = variables!();
 
@@ -68,14 +67,15 @@ impl LPSolver {
 
             for j in 0..self.m {
                 let mut expr = Expression::default();
-                for p in 0..j {
+                for p in 0..=j {
                     for i in 0..self.occurences.len() {
                         expr = expr
                             + vars_mat[i][p]
                                 * self.v_cacher.get_f64(j as i32 - p as i32, &self.letters);
                     }
                 }
-                problem = problem.with(expr.leq(self.v_cacher.get_f64(j as i32, &self.letters)));
+                problem =
+                    problem.with(expr.leq(self.v_cacher.get_f64(j as i32 + 1, &self.letters)));
             }
 
             for i in 0..self.occurences.len() {
@@ -87,30 +87,30 @@ impl LPSolver {
             }
 
             for prev in self.previous_attempts.iter() {
-                if !FORMAL_LENGTH_DEFINITION {
-                    let mut expr = Expression::default();
-                    for i in 0..self.occurences.len() {
-                        expr = expr + vars_mat[i][prev[i] as usize];
-                    }
-                    problem = problem.with(expr.leq(self.occurences.len() as f64 - 1.0));
-                } else {
-                    let mut expr = Expression::default();
-                    
+                let mut expr = Expression::default();
+                for i in 0..self.occurences.len() {
+                    expr = expr + vars_mat[i][prev[i] as usize - 1];
                 }
+                problem = problem.with(expr.leq(self.occurences.len() as f64 - 1.0));
             }
 
             // making the lengths sorted
-            let gen_expr = |i: usize| -> Expression {
-                let mut expr = Expression::default();
-                for j in 0..self.m {
-                    expr = expr + j as f64 * vars_mat[i][j];
-                }
-                expr
-            };
 
-            for i in 1..self.occurences.len() {
-                problem = problem.with(gen_expr(i - 1).leq(gen_expr(i)));
+            if !self.previous_attempts.is_empty() {
+                let gen_expr = |i: usize| -> Expression {
+                    let mut expr = Expression::default();
+                    for j in 0..self.m {
+                        expr = expr + j as f64 * vars_mat[i][j];
+                    }
+                    expr
+                };
+
+                for i in 1..self.occurences.len() {
+                    problem = problem.with(gen_expr(i - 1).leq(gen_expr(i)));
+                }
             }
+
+            problem = problem.set_parallel(HighsParallelType::On).set_threads(8);
 
             // I cannot prove that generation of max m is right, thus
             // I need to handle the case when it is not and try to adjust the value
@@ -126,18 +126,10 @@ impl LPSolver {
             };
 
             let calculate_l = |i: usize| -> u32 {
-                if !FORMAL_LENGTH_DEFINITION {
-                    for j in 0..self.m {
-                        if solution.value(vars_mat[i][j]) > 0.5 {
-                            return j as u32;
-                        }
+                for j in 0..self.m {
+                    if solution.value(vars_mat[i][j]) > 0.5 {
+                        return j as u32 + 1;
                     }
-                } else {
-                    let mut l = 0.0;
-                    for j in 0..self.m {
-                        l += j as f64 * solution.value(vars_mat[i][j]);
-                    }
-                    return l.round() as u32;
                 }
                 unreachable!()
             };
@@ -146,7 +138,15 @@ impl LPSolver {
                 lengths[i] = calculate_l(i);
             }
 
+            if self.previous_attempts.is_empty() {
+                lengths.sort_unstable();
+            }
+            
             self.previous_attempts.push(lengths.to_vec());
+
+            println!("{:?}", lengths);
+
+            println!("{}", solution.eval(minimise));
 
             let cost = lengths
                 .iter()
@@ -154,7 +154,7 @@ impl LPSolver {
                 .map(|(&l, &o)| o * l as f64)
                 .sum();
 
-            return Some(cost);
+            return Some(dbg!(cost));
         }
     }
 }

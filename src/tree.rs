@@ -53,24 +53,91 @@ impl TreeSolver for FirstToFindTreeSolver {
     }
 }
 
-pub fn optimize_tree(
-    map: &mut HashMap<TreeIndex, u32>,
-    letters: TreeIndex,
-    indices: &mut [TreeIndex],
-) {
-    map.clear();
+pub struct TreeOptimizer {
+    map: HashMap<TreeIndex, u32>,
+    vec: Vec<usize>,
+    l_copy: Vec<u32>,
+    i_copy: Vec<TreeIndex>,
+}
 
-    for i in indices.iter() {
-        let mut i = *i;
-        loop {
-            i -= 1;
-            i /= letters;
-            if i == 0 {
-                break;
-            }
-            *map.entry(i).or_insert(0) += 1;
+impl TreeOptimizer {
+    pub fn new(occurences: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            vec: vec![0; occurences],
+            l_copy: vec![0; occurences],
+            i_copy: vec![0; occurences],
         }
     }
 
-    println!("{map:?}");
+    pub fn optimize(
+        &mut self,
+        letters: &[u32],
+        lengths: &mut [u32],
+        indices: &mut [TreeIndex],
+    ) -> bool {
+        self.map.clear();
+
+        let mut optimized = false;
+
+        for i in indices.iter() {
+            let mut i = *i;
+            loop {
+                i -= 1;
+                i /= letters.len() as TreeIndex;
+                if i == 0 {
+                    break;
+                }
+                *self.map.entry(i).or_insert(0) += 1;
+            }
+        }
+
+        for ii in 0..indices.len() {
+            let mut i = indices[ii];
+            loop {
+                let mut ni = i;
+                ni -= 1;
+                ni /= letters.len() as TreeIndex;
+                if ni == 0 {
+                    break;
+                }
+                if self.map.get(&ni) != Some(&1) {
+                    break;
+                }
+                i = ni;
+            }
+            if i != indices[ii] {
+                indices[ii] = i;
+                let mut new_length = 0u32;
+                loop {
+                    i -= 1;
+                    new_length += letters[(i % letters.len() as TreeIndex) as usize];
+                    i /= letters.len() as TreeIndex;
+                    if i == 0 {
+                        break;
+                    }
+                }
+                lengths[ii] = new_length;
+                optimized = true;
+            }
+        }
+
+        if optimized {
+            for i in 0..self.vec.len() {
+                self.vec[i] = i;
+            }
+
+            self.vec.sort_unstable_by_key(|&v| lengths[v]);
+
+            self.l_copy.copy_from_slice(&lengths);
+            self.i_copy.copy_from_slice(&indices);
+
+            for i in 0..self.vec.len() {
+                lengths[i] = self.l_copy[self.vec[i]];
+                indices[i] = self.i_copy[self.vec[i]];
+            }
+        }
+
+        optimized
+    }
 }
